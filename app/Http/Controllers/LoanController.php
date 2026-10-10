@@ -68,9 +68,28 @@ class LoanController extends Controller
             return ApiResponse::error('NOT_FOUND', 'El socio indicado no existe.', [], 404);
         }
 
-        $now = $request->filled('loaned_at')
-            ? Carbon::parse($request->input('loaned_at'), 'UTC')
-            : Carbon::now('UTC');
+        $now = Carbon::now('UTC');
+        if ($request->filled('loaned_at')) {
+            try {
+                $parsed = Carbon::parse($request->input('loaned_at'), 'UTC');
+                if ($parsed->gt($now->copy()->addMinutes(5))) {
+                    return ApiResponse::error(
+                        'VALIDATION_ERROR',
+                        'La fecha de préstamo no puede ser futura.',
+                        [['field' => 'loaned_at', 'issue' => 'Fecha futura no permitida']],
+                        422
+                    );
+                }
+                $now = $parsed;
+            } catch (\Exception $e) {
+                return ApiResponse::error(
+                    'VALIDATION_ERROR',
+                    'El formato de loaned_at es inválido. Use formato ISO 8601 (UTC).',
+                    [['field' => 'loaned_at', 'issue' => 'Formato ISO inválido']],
+                    422
+                );
+            }
+        }
 
         // CA-06.5: Un socio con algún libro vencido no puede pedir otro (409)
         $hasOverdue = LoanItem::whereHas('loan', fn ($q) => $q->where('member_id', $memberId))

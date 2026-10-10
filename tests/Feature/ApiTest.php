@@ -226,4 +226,142 @@ class ApiTest extends TestCase
         $response->assertStatus(422)
             ->assertJson(['code' => 'VALIDATION_ERROR']);
     }
+
+    public function test_member_cannot_exceed_3_active_books_limit(): void
+    {
+        $token = $this->getAdminToken();
+        $cat = Category::first();
+        $member = Member::create(['full_name' => 'Marcos Lima', 'document_number' => '5544332211']);
+
+        $b1 = Book::create(['title' => 'B1', 'author' => 'Autor Test', 'isbn' => '9780000000001', 'category_id' => $cat->id, 'total_copies' => 5, 'available_copies' => 5]);
+        $b2 = Book::create(['title' => 'B2', 'author' => 'Autor Test', 'isbn' => '9780000000002', 'category_id' => $cat->id, 'total_copies' => 5, 'available_copies' => 5]);
+        $b3 = Book::create(['title' => 'B3', 'author' => 'Autor Test', 'isbn' => '9780000000003', 'category_id' => $cat->id, 'total_copies' => 5, 'available_copies' => 5]);
+        $b4 = Book::create(['title' => 'B4', 'author' => 'Autor Test', 'isbn' => '9780000000004', 'category_id' => $cat->id, 'total_copies' => 5, 'available_copies' => 5]);
+
+        // Prestar 2 libros
+        $res1 = $this->withHeader('Authorization', "Bearer {$token}")
+            ->postJson('/api/v1/loans', [
+                'member_id' => $member->id,
+                'items' => [['book_id' => $b1->id], ['book_id' => $b2->id]],
+            ]);
+        $res1->assertStatus(201);
+
+        // Intentar pedir 2 libros adicionales (2 activos + 2 nuevos = 4 > 3) -> 422
+        $res2 = $this->withHeader('Authorization', "Bearer {$token}")
+            ->postJson('/api/v1/loans', [
+                'member_id' => $member->id,
+                'items' => [['book_id' => $b3->id], ['book_id' => $b4->id]],
+            ]);
+        $res2->assertStatus(422)
+            ->assertJson(['code' => 'MEMBER_LIMIT_EXCEEDED']);
+    }
+
+    public function test_member_with_overdue_loan_is_blocked_from_new_loans(): void
+    {
+        $token = $this->getAdminToken();
+        $cat = Category::first();
+        $member = Member::create(['full_name' => 'Socio Con Mora', 'document_number' => '7788990011']);
+
+        $b1 = Book::create(['title' => 'Mora B1', 'author' => 'Autor Test', 'isbn' => '9781000000001', 'category_id' => $cat->id, 'total_copies' => 2, 'available_copies' => 2]);
+        $b2 = Book::create(['title' => 'Mora B2', 'author' => 'Autor Test', 'isbn' => '9781000000002', 'category_id' => $cat->id, 'total_copies' => 2, 'available_copies' => 2]);
+
+        // Crear préstamo histórico con loaned_at hace 20 días (vencido hace 6 días)
+        $historicalDate = now('UTC')->subDays(20)->toIso8601String();
+        $loanRes = $this->withHeader('Authorization', "Bearer {$token}")
+            ->postJson('/api/v1/loans', [
+                'member_id' => $member->id,
+                'loaned_at' => $historicalDate,
+                'items' => [['book_id' => $b1->id]],
+            ]);
+        $loanRes->assertStatus(201);
+
+        // Intentar nuevo préstamo teniendo el anterior vencido -> 409 MEMBER_HAS_OVERDUE
+        $blockedRes = $this->withHeader('Authorization', "Bearer {$token}")
+            ->postJson('/api/v1/loans', [
+                'member_id' => $member->id,
+                'items' => [['book_id' => $b2->id]],
+            ]);
+        $blockedRes->assertStatus(409)
+            ->assertJson(['code' => 'MEMBER_HAS_OVERDUE']);
+    }
+
+    public function test_cannot_delete_book_with_open_loans(): void
+    {
+        $token = $this->getAdminToken();
+        $cat = Category::first();
+        $member = Member::create(['full_name' => 'Socio Prestamo', 'document_number' => '6655443322']);
+        $book = Book::create(['title' => 'Libro Protegido', 'author' => 'Autor Test', 'isbn' => '9782000000001', 'category_id' => $cat->id, 'total_copies' => 2, 'available_copies' => 2]);
+
+        // Prestar
+        $this->withHeader('Authorization', "Bearer {$token}")
+            ->postJson('/api/v1/loans', [
+                'member_id' => $member->id,
+                'items' => [['book_id' => $book->id]],
+            ])->assertStatus(201);
+
+        // Intentar dar de baja el libro con préstamo abierto -> 409 BOOK_HAS_OPEN_LOANS
+        $delRes = $this->withHeader('Authorization', "Bearer {$token}")
+            ->deleteJson("/api/v1/books/{$book->id}");
+        $delRes->assertStatus(409)
+            ->assertJson(['code' => 'BOOK_HAS_OPEN_LOANS']);
+    }
+
+    public function test_most_borrowed_report_preserves_frozen_title_adr004(): void
+    {
+        $token = $this->getAdminToken();
+        $cat = Category::first();
+        $member = Member::create(['full_name' => 'Lector Frecuente', 'document_number' => '4433221100']);
+        $book = Book::create(['title' => 'Titulo Original 1984', 'author' => 'George Orwell', 'isbn' => '9783000000001', 'category_id' => $cat->id, 'total_copies' => 2, 'available_copies' => 2]);
+
+        // Prestar bajo el título original
+        $this->withHeader('Authorization', "Bearer {$token}")
+            ->postJson('/api/v1/loans', [
+                'member_id' => $member->id,
+                'items' => [['book_id' => $book->id]],
+            ])->assertStatus(201);
+
+        // Actualizar/renombrar el libro en el catálogo
+        $this->withHeader('Authorization', "Bearer {$token}")
+            ->putJson("/api/v1/books/{$book->id}", [
+                'title' => 'Titulo Nuevo y Modificado',
+                'author' => 'George Orwell',
+                'category_id' => $cat->id,
+                'total_copies' => 2,
+            ])->assertStatus(200);
+
+        // Consultar el reporte histórico: debe conservar 'Titulo Original 1984' según ADR-004
+        $reportRes = $this->withHeader('Authorization', "Bearer {$token}")
+            ->getJson('/api/v1/reports/most-borrowed?from=' . now('UTC')->subDay()->toDateString() . '&to=' . now('UTC')->addDay()->toDateString());
+
+        $reportRes->assertStatus(200);
+        $found = collect($reportRes->json('rows'))->firstWhere('book_id', $book->id);
+        $this->assertNotNull($found);
+        $this->assertEquals('Titulo Original 1984', $found['book_title']);
+    }
+
+    public function test_loaned_at_validation_rejects_invalid_or_future_dates(): void
+    {
+        $token = $this->getAdminToken();
+        $cat = Category::first();
+        $member = Member::create(['full_name' => 'Test Validacion', 'document_number' => '3322110099']);
+        $book = Book::create(['title' => 'Libro Val', 'author' => 'Autor Test', 'isbn' => '9784000000001', 'category_id' => $cat->id, 'total_copies' => 2, 'available_copies' => 2]);
+
+        // Fecha inválida -> 422
+        $resInvalid = $this->withHeader('Authorization', "Bearer {$token}")
+            ->postJson('/api/v1/loans', [
+                'member_id' => $member->id,
+                'loaned_at' => 'fecha-no-valida',
+                'items' => [['book_id' => $book->id]],
+            ]);
+        $resInvalid->assertStatus(422)->assertJson(['code' => 'VALIDATION_ERROR']);
+
+        // Fecha futura -> 422
+        $resFuture = $this->withHeader('Authorization', "Bearer {$token}")
+            ->postJson('/api/v1/loans', [
+                'member_id' => $member->id,
+                'loaned_at' => now('UTC')->addDays(5)->toIso8601String(),
+                'items' => [['book_id' => $book->id]],
+            ]);
+        $resFuture->assertStatus(422)->assertJson(['code' => 'VALIDATION_ERROR']);
+    }
 }
